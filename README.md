@@ -6,7 +6,7 @@ A simple WIP level editor for the game Mewgenics.
 - To add tiles click the tile option and left click to place the selected tile.
 - To remove tiles right click the tile with the tile option selected.
 - To add click the Entity option and left click to place selected entity.
-- To remove entities simply left click with the entity option selected.
+- To remove entities left click with the entity option selected.
 
 
 ## Requirements
