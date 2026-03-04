@@ -1,9 +1,32 @@
 import os
+import random
 import struct
 import tkinter as tk
+from dataclasses import dataclass, field
 from tkinter import filedialog, messagebox
 
 DEFAULT_TILE = 0
+
+
+@dataclass
+class SpawnObject:
+    id: int
+    wave: int = 0
+    roll_index: int = 0
+    options: list = field(default_factory=list)  # [(spawn_id, weight), ...]
+
+    def __post_init__(self):
+        self.id &= 0xFFFF
+        self.wave &= 0xFF
+        self.roll_index &= 0xFF
+        cleaned = []
+        for pid, weight in self.options:
+            cleaned.append((int(pid) & 0xFFFF, int(weight) & 0xFFFF))
+        self.options = cleaned
+
+    @property
+    def is_random(self):
+        return self.id == 0xFFFF
 
 
 class LevelData:
@@ -13,8 +36,10 @@ class LevelData:
         self.width = 10
         self.height = 10
         self.mode = 1
+        self.spawn_file = "spawns.gon"
+        self.tiles_file = "tiles.gon"
         self.tiles = [DEFAULT_TILE] * (self.width * self.height)
-        self.entities = {}  # (x,y) -> [(id, extra), ...]
+        self.entities = {}  # (x,y) -> [SpawnObject, ...]
         self.raw_prefix = b""
         self.raw_tiles = b""
         self.raw_spawns = b""
@@ -85,14 +110,20 @@ def load_level_file(path):
         offset += 1
         _reserved = struct.unpack_from("<B", data, offset)[0]
         offset += 1
-        entities.append((x, y, id_, wave))
 
+        record = SpawnObject(id=id_, wave=wave)
         if id_ == 0xFFFF:
             num_poss = struct.unpack_from("<B", data, offset)[0]
             offset += 1
-            _roll_index = struct.unpack_from("<B", data, offset)[0]
+            roll_index = struct.unpack_from("<B", data, offset)[0]
             offset += 1
-            offset += num_poss * 4
+            options = []
+            for _ in range(num_poss):
+                pid, weight = struct.unpack_from("<HH", data, offset)
+                offset += 4
+                options.append((pid, weight))
+            record = SpawnObject(id=id_, wave=wave, roll_index=roll_index, options=options)
+        entities.append((x, y, record))
 
     spawns_end = offset
     tail = data[offset:]
@@ -207,8 +238,9 @@ class LevelEditor(tk.Tk):
         self.resizable(True, True)
 
         self.level = LevelData()
-        self.spawn_names = load_spawn_defs("spawns.gon")
-        self.tile_defs = load_tile_defs("tiles.gon")
+        self.base_dir = os.path.dirname(os.path.abspath(__file__))
+        self.spawn_names = load_spawn_defs(self._resolve_local_path("spawns.gon"))
+        self.tile_defs = load_tile_defs(self._resolve_local_path("tiles.gon"))
         self.tile_names = {k: v.get("name", f"Tile {k}") for k, v in self.tile_defs.items()}
         self.tile_colors = self._build_tile_colors()
 
@@ -217,6 +249,8 @@ class LevelEditor(tk.Tk):
         self.canvas_size = self.cell_size * 10 + 20
 
         self._build_ui()
+        self._on_mode_change()
+        self._on_spawn_type_change()
         self._draw_grid()
 
     def _build_ui(self):
@@ -229,6 +263,7 @@ class LevelEditor(tk.Tk):
         path_entry.pack(side="left", padx=6)
 
         tk.Button(top, text="Browse", command=self._browse).pack(side="left")
+        tk.Button(top, text="New", command=self._new_room).pack(side="left", padx=4)
         tk.Button(top, text="Load", command=self._load).pack(side="left", padx=4)
         tk.Button(top, text="Save", command=self._save).pack(side="left", padx=4)
         tk.Button(top, text="Save As", command=self._save_as).pack(side="left")
@@ -244,6 +279,51 @@ class LevelEditor(tk.Tk):
         self.tile_var = tk.IntVar(value=DEFAULT_TILE)
         self.entity_id_var = tk.StringVar(value="2050")
         self.entity_extra_var = tk.StringVar(value="0")
+        self.entity_spawn_type_var = tk.StringVar(value="fixed")
+        self.entity_roll_index_var = tk.StringVar(value="0")
+        self.pool_weight_var = tk.StringVar(value="1")
+        self.random_pool = []
+        self.preview_active = False
+        self.preview_map = {}
+
+        self.entity_controls = tk.Frame(self)
+        self.entity_controls.pack(fill="x", padx=8, pady=(0, 6))
+        tk.Label(self.entity_controls, text="ID").pack(side="left")
+        tk.Entry(self.entity_controls, textvariable=self.entity_id_var, width=8).pack(side="left", padx=(4, 10))
+        tk.Label(self.entity_controls, text="Wave").pack(side="left")
+        tk.Entry(self.entity_controls, textvariable=self.entity_extra_var, width=5).pack(side="left", padx=(4, 10))
+        tk.Radiobutton(
+            self.entity_controls,
+            text="Fixed",
+            variable=self.entity_spawn_type_var,
+            value="fixed",
+            command=self._on_spawn_type_change,
+        ).pack(side="left")
+        tk.Radiobutton(
+            self.entity_controls,
+            text="Random",
+            variable=self.entity_spawn_type_var,
+            value="random",
+            command=self._on_spawn_type_change,
+        ).pack(side="left", padx=(4, 10))
+
+        self.random_controls = tk.Frame(self)
+        self.random_controls.pack(fill="x", padx=8, pady=(0, 6))
+        tk.Label(self.random_controls, text="Roll Index").pack(side="left")
+        tk.Entry(self.random_controls, textvariable=self.entity_roll_index_var, width=5).pack(side="left", padx=(4, 10))
+        tk.Label(self.random_controls, text="Weight").pack(side="left")
+        tk.Entry(self.random_controls, textvariable=self.pool_weight_var, width=6).pack(side="left", padx=(4, 10))
+        tk.Button(self.random_controls, text="Add", command=self._pool_add).pack(side="left")
+        tk.Button(self.random_controls, text="Remove", command=self._pool_remove).pack(side="left", padx=(4, 0))
+        tk.Button(self.random_controls, text="Clear", command=self._pool_clear).pack(side="left", padx=(4, 0))
+
+        self.pool_list = tk.Listbox(self, height=5, exportselection=False)
+        self.pool_list.pack(fill="x", padx=8, pady=(0, 6))
+
+        self.random_tools = tk.Frame(self)
+        self.random_tools.pack(fill="x", padx=8, pady=(0, 6))
+        tk.Button(self.random_tools, text="Preview Randomization", command=self._preview_randomization).pack(side="left", padx=(8, 0))
+        tk.Button(self.random_tools, text="Reset Preview", command=self._reset_preview).pack(side="left", padx=(4, 0))
 
         content = tk.Frame(self)
         content.pack(fill="both", expand=True, padx=8, pady=6)
@@ -271,11 +351,76 @@ class LevelEditor(tk.Tk):
         self.canvas.pack(side="left", fill="both", expand=True)
         self.canvas.bind("<Button-1>", self._on_left_click)
         self.canvas.bind("<Button-3>", self._on_right_click)
+        self.canvas.bind("<Button-2>", self._pick_from_cell)
+        self.canvas.bind("<Shift-Button-1>", self._pick_from_cell)
         self.canvas.bind("<Configure>", self._on_canvas_resize)
 
         self.status_var = tk.StringVar(value="Ready.")
         status = tk.Label(self, textvariable=self.status_var, anchor="w")
         status.pack(fill="x", padx=8, pady=(6, 6))
+
+    def _resolve_local_path(self, filename):
+        local = os.path.join(self.base_dir, filename)
+        return local if os.path.exists(local) else filename
+
+    def _normalize_input_path(self, raw_path):
+        p = (raw_path or "").strip().strip('"').strip("'")
+        if not p:
+            return ""
+        p = os.path.expandvars(os.path.expanduser(p))
+        if os.name != "nt" and "\\" in p and "/" not in p:
+            p = p.replace("\\", os.sep)
+        return os.path.normpath(p)
+
+    def _reload_defs_for_level(self, level_path):
+        level_dir = os.path.dirname(level_path)
+        spawn_path = os.path.join(level_dir, "spawns.gon")
+        tile_path = os.path.join(level_dir, "tiles.gon")
+
+        if not os.path.exists(spawn_path):
+            spawn_path = self._resolve_local_path("spawns.gon")
+        if not os.path.exists(tile_path):
+            tile_path = self._resolve_local_path("tiles.gon")
+
+        self.spawn_names = load_spawn_defs(spawn_path)
+        self.tile_defs = load_tile_defs(tile_path)
+        self.tile_names = {k: v.get("name", f"Tile {k}") for k, v in self.tile_defs.items()}
+        self.tile_colors = self._build_tile_colors()
+
+    def _build_default_prefix(self, level):
+        spawn_file = (level.spawn_file or "spawns.gon").encode("utf-8", errors="ignore")
+        tiles_file = (level.tiles_file or "tiles.gon").encode("utf-8", errors="ignore")
+        header = struct.pack(
+            "<9i",
+            int(level.version),
+            int(level.width),
+            int(level.height),
+            int(level.mode),
+            0,  # entity count, patched later
+            0,  # cam x
+            0,  # cam y
+            int(level.width),  # cam w
+            int(level.height),  # cam h
+        )
+        return (
+            header
+            + struct.pack("<i", len(spawn_file))
+            + spawn_file
+            + struct.pack("<i", len(tiles_file))
+            + tiles_file
+            + struct.pack("<ii", 0, 0)
+        )
+
+    def _new_room(self):
+        if self.preview_active:
+            self._reset_preview(silent=True)
+        self.level = LevelData()
+        self.random_pool = []
+        self._refresh_pool_list()
+        self.path_var.set("")
+        self._populate_sidebar_list()
+        self._draw_grid()
+        self.status_var.set("New blank room.")
 
     def _on_canvas_resize(self, event):
         size = min(event.width, event.height)
@@ -319,8 +464,17 @@ class LevelEditor(tk.Tk):
 
         ent_list = self.level.entities.get((x, y), [])
         if ent_list:
-            ent_id, _ = ent_list[0]
-            label = self.spawn_names.get(ent_id, str(ent_id))
+            ent = ent_list[0]
+            ent_id = ent.id
+            if ent.is_random:
+                if self.preview_active:
+                    resolved_id = self.preview_map.get((x, y, 0), 0)
+                    label = self.spawn_names.get(resolved_id, str(resolved_id))
+                else:
+                    first_id = ent.options[0][0] if ent.options else 0
+                    label = f"RND:{self.spawn_names.get(first_id, str(first_id))}"
+            else:
+                label = self.spawn_names.get(ent_id, str(ent_id))
             text = label
             if len(ent_list) > 1:
                 text = f"{text}*"
@@ -480,29 +634,39 @@ class LevelEditor(tk.Tk):
     def _browse(self):
         path = filedialog.askopenfilename(filetypes=[("Level files", "*.lvl"), ("All files", "*.*")])
         if path:
-            self.path_var.set(path)
+            self.path_var.set(self._normalize_input_path(path))
 
     def _load(self):
-        path = self.path_var.get().strip()
+        path = self._normalize_input_path(self.path_var.get())
         if not path:
             messagebox.showerror("Load", "Please choose a .lvl file.")
+            return
+        if not os.path.exists(path):
+            messagebox.showerror("Load", f"File not found:\n{path}")
             return
         try:
             loaded = self._load_level(path)
         except Exception as exc:
             messagebox.showerror("Load failed", str(exc))
             return
+        self._reload_defs_for_level(path)
+        self.preview_active = False
+        self.preview_map = {}
         self.level = loaded
+        self.random_pool = []
+        self._refresh_pool_list()
         self.path_var.set(path)
         self._populate_sidebar_list()
         self._draw_grid()
         self.status_var.set(f"Loaded {path}")
 
     def _save(self):
-        path = self.path_var.get().strip()
+        path = self._normalize_input_path(self.path_var.get())
         if not path:
             self._save_as()
             return
+        if self.preview_active:
+            self._reset_preview(silent=True)
         try:
             self._save_level(path)
         except Exception as exc:
@@ -514,7 +678,7 @@ class LevelEditor(tk.Tk):
         path = filedialog.asksaveasfilename(defaultextension=".lvl", filetypes=[("Level files", "*.lvl")])
         if not path:
             return
-        self.path_var.set(path)
+        self.path_var.set(self._normalize_input_path(path))
         self._save()
 
     def _cell_from_event(self, event):
@@ -529,6 +693,8 @@ class LevelEditor(tk.Tk):
         cell = self._cell_from_event(event)
         if not cell:
             return
+        if self.preview_active:
+            self._reset_preview(silent=True)
         x, y = cell
         if self.mode_var.get() == "tile":
             tile_id = int(self.tile_var.get())
@@ -536,18 +702,36 @@ class LevelEditor(tk.Tk):
             self._select_tile_in_list(tile_id)
         else:
             try:
-                ent_id = int(self.entity_id_var.get(), 0)
-                ent_extra = int(self.entity_extra_var.get(), 0)
+                ent_extra = int(self.entity_extra_var.get(), 0) & 0xFF
             except Exception:
                 self.status_var.set("Invalid entity id/extra.")
                 return
-            self.level.entities[(x, y)] = [(ent_id, ent_extra)]
+            if self.entity_spawn_type_var.get() == "random":
+                try:
+                    roll_index = int(self.entity_roll_index_var.get(), 0) & 0xFF
+                except Exception:
+                    self.status_var.set("Invalid roll index.")
+                    return
+                if not self.random_pool:
+                    self.status_var.set("Random pool is empty.")
+                    return
+                record = SpawnObject(id=0xFFFF, wave=ent_extra, roll_index=roll_index, options=list(self.random_pool))
+            else:
+                try:
+                    ent_id = int(self.entity_id_var.get(), 0) & 0xFFFF
+                except Exception:
+                    self.status_var.set("Invalid entity id.")
+                    return
+                record = SpawnObject(id=ent_id, wave=ent_extra)
+            self.level.entities[(x, y)] = [record]
         self._draw_grid()
 
     def _on_right_click(self, event):
         cell = self._cell_from_event(event)
         if not cell:
             return
+        if self.preview_active:
+            self._reset_preview(silent=True)
         x, y = cell
         if self.mode_var.get() == "tile":
             self.level.tiles[y * 10 + x] = DEFAULT_TILE
@@ -555,6 +739,28 @@ class LevelEditor(tk.Tk):
             if (x, y) in self.level.entities:
                 del self.level.entities[(x, y)]
         self._draw_grid()
+
+    def _pick_from_cell(self, event):
+        if self.mode_var.get() != "entity":
+            return
+        cell = self._cell_from_event(event)
+        if not cell:
+            return
+        ent_list = self.level.entities.get(cell, [])
+        if not ent_list:
+            return
+        ent = ent_list[0]
+        self.entity_extra_var.set(str(ent.wave))
+        if ent.is_random:
+            self.entity_spawn_type_var.set("random")
+            self.entity_roll_index_var.set(str(ent.roll_index))
+            self.random_pool = list(ent.options)
+        else:
+            self.entity_spawn_type_var.set("fixed")
+            self.entity_id_var.set(str(ent.id))
+            self.random_pool = []
+        self._on_spawn_type_change()
+        self._refresh_pool_list()
 
     def _update_status(self):
         ent_count = sum(len(v) for v in self.level.entities.values())
@@ -571,6 +777,121 @@ class LevelEditor(tk.Tk):
 
     def _on_mode_change(self):
         self._populate_sidebar_list()
+        is_entity = self.mode_var.get() == "entity"
+        if is_entity:
+            self.entity_controls.pack(fill="x", padx=8, pady=(0, 6))
+            self.random_tools.pack(fill="x", padx=8, pady=(0, 6))
+            self._on_spawn_type_change()
+        else:
+            self.entity_controls.pack_forget()
+            self.random_controls.pack_forget()
+            self.pool_list.pack_forget()
+            self.random_tools.pack_forget()
+
+    def _on_spawn_type_change(self):
+        if self.mode_var.get() != "entity":
+            self.random_controls.pack_forget()
+            self.pool_list.pack_forget()
+            return
+        if self.entity_spawn_type_var.get() == "random":
+            self.random_controls.pack(fill="x", padx=8, pady=(0, 6))
+            self.pool_list.pack(fill="x", padx=8, pady=(0, 6))
+        else:
+            self.random_controls.pack_forget()
+            self.pool_list.pack_forget()
+        self._refresh_pool_list()
+
+    def _pool_add(self):
+        if self.preview_active:
+            self._reset_preview(silent=True)
+        try:
+            spawn_id = int(self.entity_id_var.get(), 0) & 0xFFFF
+            weight = int(self.pool_weight_var.get(), 0) & 0xFFFF
+        except Exception:
+            self.status_var.set("Invalid random pool id/weight.")
+            return
+        if weight <= 0:
+            self.status_var.set("Weight must be > 0.")
+            return
+        self.random_pool.append((spawn_id, weight))
+        self._refresh_pool_list(select_idx=len(self.random_pool) - 1)
+
+    def _pool_remove(self):
+        if self.preview_active:
+            self._reset_preview(silent=True)
+        sel = self.pool_list.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        if 0 <= idx < len(self.random_pool):
+            del self.random_pool[idx]
+            self._refresh_pool_list(select_idx=max(0, idx - 1))
+
+    def _pool_clear(self):
+        if self.preview_active:
+            self._reset_preview(silent=True)
+        self.random_pool = []
+        self._refresh_pool_list()
+
+    def _refresh_pool_list(self, select_idx=None):
+        self.pool_list.delete(0, tk.END)
+        total = sum(weight for _pid, weight in self.random_pool)
+        for idx, (pid, weight) in enumerate(self.random_pool):
+            pct = (100.0 * weight / total) if total > 0 else 0.0
+            name = self.spawn_names.get(pid, str(pid))
+            self.pool_list.insert(tk.END, f"{idx + 1}. {name} ({pid})  w={weight}  {pct:.1f}%")
+        if select_idx is not None and 0 <= select_idx < len(self.random_pool):
+            self.pool_list.selection_clear(0, tk.END)
+            self.pool_list.selection_set(select_idx)
+            self.pool_list.see(select_idx)
+
+    def _roll_from_options(self, options, roll_value=None):
+        if not options:
+            return 0
+        total = sum(max(0, weight) for _pid, weight in options)
+        if total <= 0:
+            return options[0][0]
+        if roll_value is None:
+            roll_value = random.random()
+        if roll_value < 0.0:
+            roll_value = 0.0
+        if roll_value >= 1.0:
+            roll_value = 0.999999
+        target = roll_value * total
+        running = 0.0
+        for pid, weight in options:
+            running += max(0, weight)
+            if target < running:
+                return pid
+        return options[-1][0]
+
+    def _preview_randomization(self):
+        shared_rolls = {}
+        preview = {}
+        random_count = 0
+        for (x, y), ent_list in self.level.entities.items():
+            for idx, ent in enumerate(ent_list):
+                if not ent.is_random:
+                    continue
+                roll_index = ent.roll_index & 0xFF
+                roll_value = None
+                if roll_index != 0:
+                    if roll_index not in shared_rolls:
+                        shared_rolls[roll_index] = random.random()
+                    roll_value = shared_rolls[roll_index]
+                preview[(x, y, idx)] = self._roll_from_options(ent.options, roll_value=roll_value)
+                random_count += 1
+        self.preview_map = preview
+        self.preview_active = True
+        self._draw_grid()
+        self.status_var.set(f"Preview randomization: {random_count} random spawn(s) resolved.")
+
+    def _reset_preview(self, silent=False):
+        self.preview_active = False
+        self.preview_map = {}
+        self._draw_grid()
+        if not silent:
+            self.status_var.set("Preview reset.")
 
     def _on_sidebar_search(self, _event):
         self._populate_sidebar_list()
@@ -587,6 +908,8 @@ class LevelEditor(tk.Tk):
         data.width = lvl_data["width"]
         data.height = lvl_data["height"]
         data.mode = lvl_data["mode"]
+        data.spawn_file = lvl_data.get("spawn_file", "spawns.gon") or "spawns.gon"
+        data.tiles_file = lvl_data.get("tiles_file", "tiles.gon") or "tiles.gon"
         # Flip vertically to match editor origin (0,0 at bottom-left).
         tiles = [0] * (data.width * data.height)
         for y in range(data.height):
@@ -602,25 +925,23 @@ class LevelEditor(tk.Tk):
 
         # Flip entities vertically to match editor origin (0,0 at bottom-left).
         ent_map = {}
-        for x, y, ent_id, extra in lvl_data["entities"]:
+        for x, y, spawn in lvl_data["entities"]:
             ny = data.height - 1 - y
-            ent_map.setdefault((x, ny), []).append((ent_id, extra))
+            ent_map.setdefault((x, ny), []).append(spawn)
         data.entities = ent_map
-        data.original_entities = sorted(lvl_data["entities"], key=lambda e: (e[1], e[0], e[2], e[3]))
+        data.original_entities = []
         return data
 
     def _save_level(self, path):
-        if not self.level.raw_prefix:
-            raise ValueError("No level loaded. Load a .lvl file first.")
         if len(self.level.tiles) != 100:
             raise ValueError("Tile grid must be 10x10.")
 
         # Flatten entities
         entities = []
         for (x, y) in sorted(self.level.entities.keys(), key=lambda p: (p[1], p[0])):
-            for ent_id, extra in self.level.entities[(x, y)]:
+            for ent in self.level.entities[(x, y)]:
                 ny = 10 - 1 - y
-                entities.append((x, ny, ent_id, extra))
+                entities.append((x, ny, ent))
 
         entity_count = len(entities)
         if self.level.original_tiles == self.level.tiles and self.level.raw_tiles:
@@ -634,14 +955,22 @@ class LevelEditor(tk.Tk):
                     tiles_out[y * 10 + x] = self.level.tiles[src_y * 10 + x]
             tile_bytes = struct.pack("<100H", *tiles_out)
 
-        current_entities_sorted = sorted(entities, key=lambda e: (e[1], e[0], e[2], e[3]))
-        if current_entities_sorted == self.level.original_entities and self.level.raw_spawns:
-            entity_bytes = self.level.raw_spawns
-        else:
-            # Writes fixed records only; random-group metadata is not preserved when entities are edited.
-            entity_bytes = b"".join(struct.pack("<hhHBB", x, y, ent_id, extra & 0xFF, 0) for x, y, ent_id, extra in entities)
+        chunks = []
+        for x, y, ent in entities:
+            ent_id = ent.id
+            wave = ent.wave & 0xFF
+            chunks.append(struct.pack("<hhHBB", x, y, ent_id, wave, 0))
+            if ent.is_random:
+                options = list(ent.options)
+                if len(options) > 255:
+                    raise ValueError("Random spawn has more than 255 options.")
+                chunks.append(struct.pack("<BB", len(options) & 0xFF, ent.roll_index & 0xFF))
+                for pid, weight in options:
+                    chunks.append(struct.pack("<HH", pid & 0xFFFF, weight & 0xFFFF))
+        entity_bytes = b"".join(chunks)
 
-        new_data = bytearray(self.level.raw_prefix + tile_bytes + entity_bytes + self.level.tail)
+        raw_prefix = self.level.raw_prefix if self.level.raw_prefix else self._build_default_prefix(self.level)
+        new_data = bytearray(raw_prefix + tile_bytes + entity_bytes + self.level.tail)
         struct.pack_into("<I", new_data, 16, entity_count)
 
         with open(path, "wb") as f:
