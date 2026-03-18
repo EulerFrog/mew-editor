@@ -1,4 +1,6 @@
 __pycache__/
 *.py[cod]
+
 levels
 _unpacked
+hidden

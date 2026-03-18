@@ -1,5 +1,6 @@
 import os
 import random
+import re
 import struct
 import tkinter as tk
 from dataclasses import dataclass, field
@@ -44,9 +45,6 @@ class LevelData:
         self.original_tiles = []
         self.original_entities = []
         self.tail = b""
-
-    def clear(self):
-        self.__init__()
 
 
 def load_level_file(path):
@@ -148,7 +146,6 @@ def load_level_file(path):
 
 def _parse_gon_value(val):
     """Parse a gon value string into a str or list."""
-    import re
     val = val.strip()
     if val.startswith('['):
         inner = val[1:-1].strip()
@@ -176,7 +173,6 @@ def _parse_gon_value(val):
 
 def _parse_gon(path):
     """Parse a .gon file capturing all editor-block fields into {id: {key: value}}."""
-    import re
     if not os.path.exists(path):
         return {}
     defs = {}
@@ -280,6 +276,12 @@ class LevelEditor(tk.Tk):
         tk.Radiobutton(controls, text="Tile", variable=self.mode_var, value="tile", command=self._on_mode_change).pack(side="left")
         tk.Radiobutton(controls, text="Entity", variable=self.mode_var, value="entity", command=self._on_mode_change).pack(side="left")
 
+        def_row = tk.Frame(self)
+        def_row.pack(fill="x", padx=8, pady=(0, 4))
+        self.def_file_var = tk.StringVar(value=self.level.tiles_file)
+        tk.Entry(def_row, textvariable=self.def_file_var, width=20, state="readonly").pack(side="left", padx=(0, 6))
+        tk.Button(def_row, text="Change", command=self._change_def_file).pack(side="left")
+
         self.tile_var = tk.IntVar(value=0)
         self.entity_id_var = tk.StringVar(value="")
         self.entity_extra_var = tk.StringVar(value="0")
@@ -359,7 +361,7 @@ class LevelEditor(tk.Tk):
         self.canvas.bind("<Shift-Button-1>", self._pick_from_cell)
         self.canvas.bind("<Configure>", self._on_canvas_resize)
 
-        self.status_var = tk.StringVar(value="Ready.")
+        self.status_var = tk.StringVar(value="")
         status = tk.Label(self, textvariable=self.status_var, anchor="w")
         status.pack(fill="x", padx=8, pady=(6, 6))
 
@@ -391,7 +393,6 @@ class LevelEditor(tk.Tk):
 
     def _parse_tint_color(self, tint_str):
         """Convert a tint string to an (r, g, b) tuple 0-255, or None."""
-        import re
         if not tint_str or tint_str.lower() == "none":
             return None
         tint_str = tint_str.strip()
@@ -421,12 +422,14 @@ class LevelEditor(tk.Tk):
                     r, g, b = int(parts[0]), int(parts[1]), int(parts[2])
                 else:
                     r, g, b = color[0], color[1], color[2]
+                    
                 copy.put(f"#{r*tr//255:02x}{g*tg//255:02x}{b*tb//255:02x}", (px, py))
+                
         return copy
 
     def _apply_color_key(self, img):
         """Make all pixels matching _COLOR_KEY transparent."""
-        kr, kg, kb = self._COLOR_KEY
+        kr, kg, kb = self._TRANSPARENT
         w, h = img.width(), img.height()
         pixels = []
         for py in range(h):
@@ -504,6 +507,22 @@ class LevelEditor(tk.Tk):
         if os.name != "nt" and "\\" in p and "/" not in p:
             p = p.replace("\\", os.sep)
         return os.path.normpath(p)
+
+    def _change_def_file(self):
+        path = filedialog.askopenfilename(filetypes=[("GON files", "*.gon"), ("All files", "*.*")])
+        if not path:
+            return
+        is_entity = self.mode_var.get() == "entity"
+        if is_entity:
+            self.level.spawn_file = path
+        else:
+            self.level.tiles_file = path
+        self.def_file_var.set(path)
+        level_path = self.level.path or self.base_dir
+        self._reload_defs_for_level(level_path, self.level.spawn_file, self.level.tiles_file)
+        self._populate_sidebar_list()
+        self._draw_grid()
+        self.status_var.set(f"Def file changed: {os.path.basename(path)}")
 
     def _reload_defs_for_level(self, level_path, spawn_file, tiles_file):
         level_dir = os.path.dirname(level_path)
@@ -597,7 +616,7 @@ class LevelEditor(tk.Tk):
 
     _ICON_SIZE = 128
     _VALID_CELL_SIZES = [16, 32, 64]  # 128 // 8, 128 // 4, 128 // 2
-    _COLOR_KEY = (255, 0, 255)  # magenta background used in all editor icons
+    _TRANSPARENT = (255, 0, 255)  # magenta background used in all editor icons
 
     def _snap_cell_size(self, raw):
         """Snap raw pixel size to the nearest icon-compatible cell size."""
@@ -687,9 +706,6 @@ class LevelEditor(tk.Tk):
             )
 
 
-    def _tile_label(self, tile_id):
-        name = self.tile_names.get(tile_id, "Unknown")
-        return f"{name} ({tile_id})"
 
     def _populate_tile_list(self, filter_text=""):
         self.sidebar_listbox.delete(0, tk.END)
@@ -781,6 +797,8 @@ class LevelEditor(tk.Tk):
         self.random_pool = []
         self._refresh_pool_list()
         self.path_var.set(path)
+        is_entity = self.mode_var.get() == "entity"
+        self.def_file_var.set(loaded.spawn_file if is_entity else loaded.tiles_file)
         self._populate_sidebar_list()
         self._draw_grid()
         self.status_var.set(f"Loaded {path}")
@@ -888,8 +906,7 @@ class LevelEditor(tk.Tk):
         self._refresh_pool_list()
 
     def _update_status(self):
-        ent_count = sum(len(v) for v in self.level.entities.values())
-        self.status_var.set(f"Tiles: {len(self.level.tiles)}  Entities: {ent_count}")
+        pass
 
     def _populate_sidebar_list(self):
         filter_text = self.sidebar_search_var.get().strip()
@@ -907,11 +924,13 @@ class LevelEditor(tk.Tk):
             self.entity_controls.pack(fill="x", padx=8, pady=(0, 6))
             self.random_tools.pack(fill="x", padx=8, pady=(0, 6))
             self._on_spawn_type_change()
+            self.def_file_var.set(self.level.spawn_file or "spawns.gon")
         else:
             self.entity_controls.pack_forget()
             self.random_controls.pack_forget()
             self.pool_list.pack_forget()
             self.random_tools.pack_forget()
+            self.def_file_var.set(self.level.tiles_file or "tiles.gon")
 
     def _on_spawn_type_change(self):
         if self.mode_var.get() != "entity":
@@ -1092,6 +1111,7 @@ class LevelEditor(tk.Tk):
                 chunks.append(struct.pack("<BB", len(options) & 0xFF, ent.roll_index & 0xFF))
                 for pid, weight in options:
                     chunks.append(struct.pack("<HH", pid & 0xFFFF, weight & 0xFFFF))
+                    
         entity_bytes = b"".join(chunks)
 
         raw_prefix = self._build_default_prefix(self.level)
