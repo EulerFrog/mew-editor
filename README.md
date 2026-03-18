@@ -2,7 +2,7 @@
 A simple WIP level editor for the game Mewgenics.
 
 ## Usage
-- To use first select a level.
+- To use first select a level from your local files and click Load or select the New option and start from a blank template.
 - To add tiles click the tile option and left click to place the selected tile.
 - To remove tiles right click the tile with the tile option selected.
 - To add click the Entity option and left click to place selected entity.
@@ -21,6 +21,5 @@ python3 level_editor.py
 Make sure that `spawns.gon` and `tiles.gon` are in the same directory as the level editor file.
 
 ## TODO
-- random spawn logic
-- dev art
-- better tile coloring
+- random spawn grouping
+- 
