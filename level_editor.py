@@ -7,7 +7,6 @@ from tkinter import filedialog, messagebox
 
 DEFAULT_TILE = 0
 
-
 @dataclass
 class SpawnObject:
     id: int
@@ -122,6 +121,7 @@ def load_level_file(path):
                 pid, weight = struct.unpack_from("<HH", data, offset)
                 offset += 4
                 options.append((pid, weight))
+                
             record = SpawnObject(id=id_, wave=wave, roll_index=roll_index, options=options)
         entities.append((x, y, record))
 
@@ -147,88 +147,90 @@ def load_level_file(path):
     }
 
 
-def load_tile_defs(path):
-    if not os.path.exists(path):
-        return {}
-    tile_defs = {}
-    current_id = None
-    in_editor = False
-    name = None
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            stripped = line.strip()
-            if not stripped or stripped.startswith("//"):
-                continue
-            if current_id is None and stripped[0].isdigit() and stripped.endswith("{"):
-                try:
-                    current_id = int(stripped.split()[0])
-                    name = None
-                    in_editor = False
-                except Exception:
-                    current_id = None
-                continue
-            if current_id is None:
-                continue
-            if stripped.startswith("editor"):
-                in_editor = True
-                continue
-            if in_editor and stripped.startswith("name "):
-                try:
-                    name = stripped.split('name "', 1)[1].split('"', 1)[0]
-                except Exception:
-                    pass
-                continue
-            if stripped == "}":
-                if in_editor:
-                    in_editor = False
-                    continue
-                if current_id is not None:
-                    tile_defs[current_id] = {
-                        "name": name or f"Tile {current_id}",
-                    }
-                current_id = None
-                name = None
-    return tile_defs
+def _parse_gon_value(val):
+    """Parse a gon value string into a str or list."""
+    import re
+    val = val.strip()
+    if val.startswith('['):
+        inner = val[1:-1].strip()
+        items = []
+        while inner:
+            inner = inner.lstrip(', ')
+            if not inner:
+                break
+            if inner.startswith('['):
+                end = inner.index(']')
+                items.append(inner[:end + 1])
+                inner = inner[end + 1:]
+            else:
+                m = re.match(r'"([^"]+)"|(\S+)', inner)
+                if m:
+                    items.append(m.group(1) or m.group(2))
+                    inner = inner[m.end():]
+                else:
+                    break
+        return items
+    if val.startswith('"') and val.endswith('"'):
+        return val[1:-1]
+    return val
 
 
-def load_spawn_defs(path):
+def _parse_gon(path):
+    """Parse a .gon file capturing all editor-block fields into {id: {key: value}}."""
+    import re
     if not os.path.exists(path):
         return {}
-    spawn_defs = {}
+    defs = {}
     current_id = None
-    name = None
     depth = 0
+    in_editor = False
+    entry = {}
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
-            stripped = line.strip()
-            if not stripped or stripped.startswith("//"):
+            s = line.strip()
+            if not s or s.startswith("//"):
                 continue
+            opens = s.count("{")
+            closes = s.count("}")
             if current_id is None:
-                if stripped[0].isdigit() and stripped.endswith("{"):
+                if s[0].isdigit() and "{" in s:
                     try:
-                        current_id = int(stripped.split()[0])
-                        name = None
+                        current_id = int(s.split()[0])
                         depth = 1
+                        entry = {}
+                        in_editor = False
                     except Exception:
-                        current_id = None
-                        depth = 0
+                        pass
                 continue
-            if "{" in stripped:
-                depth += stripped.count("{")
-            if "}" in stripped:
-                depth -= stripped.count("}")
-            if name is None and 'name "' in stripped:
-                try:
-                    name = stripped.split('name "', 1)[1].split('"', 1)[0]
-                except Exception:
-                    pass
+            if re.match(r'^editor\b', s):
+                in_editor = True
+            depth += opens - closes
+            if in_editor and depth > 1:
+                m = re.match(r'^(\w+)\s+(.+)$', s.rstrip('{').strip())
+                if m:
+                    key, raw_val = m.group(1), m.group(2).strip()
+                    if key not in entry:
+                        entry[key] = _parse_gon_value(raw_val)
+            if in_editor and depth <= 1:
+                in_editor = False
+                if "images" not in entry and "image" in entry:
+                    v = entry["image"]
+                    entry["images"] = [os.path.splitext(f)[0].lower() for f in (v if isinstance(v, list) else [v])]
+                elif "images" in entry:
+                    entry["images"] = [os.path.splitext(f)[0].lower() for f in entry["images"]]
             if depth <= 0:
-                if name:
-                    spawn_defs[current_id] = name
+                defs[current_id] = entry
                 current_id = None
-                name = None
                 depth = 0
-    return spawn_defs
+                entry = {}
+    return defs
+
+
+def load_defs(tiles_path, spawns_path):
+    return {
+        "tiles": _parse_gon(tiles_path),
+        "spawns": _parse_gon(spawns_path),
+    }
 
 
 class LevelEditor(tk.Tk):
@@ -239,14 +241,17 @@ class LevelEditor(tk.Tk):
 
         self.level = LevelData()
         self.base_dir = os.path.dirname(os.path.abspath(__file__))
-        self.spawn_names = load_spawn_defs(self._resolve_local_path("spawns.gon"))
-        self.tile_defs = load_tile_defs(self._resolve_local_path("tiles.gon"))
-        self.tile_names = {k: v.get("name", f"Tile {k}") for k, v in self.tile_defs.items()}
-        self.tile_colors = self._build_tile_colors()
+        self._load_defs(
+            self._resolve_local_path("tiles.gon"),
+            self._resolve_local_path("spawns.gon"),
+        )
 
-        self.cell_size = 36
+        self.cell_size = 32
         self.grid_origin = (10, 10)
         self.canvas_size = self.cell_size * 10 + 20
+        self._icon_raw_cache = {}    # stem -> PhotoImage (full-size, color-keyed)
+        self._icon_tinted_cache = {} # (stem, tint) -> PhotoImage (full-size, tinted)
+        self._icon_cache = {}        # (stem, tint, cell_size) -> PhotoImage (subsampled)
 
         self._build_ui()
         self._on_mode_change()
@@ -263,7 +268,7 @@ class LevelEditor(tk.Tk):
         path_entry.pack(side="left", padx=6)
 
         tk.Button(top, text="Browse", command=self._browse).pack(side="left")
-        tk.Button(top, text="New", command=self._new_room).pack(side="left", padx=4)
+        tk.Button(top, text="Create", command=self._create_room).pack(side="left", padx=4)
         tk.Button(top, text="Load", command=self._load).pack(side="left", padx=4)
         tk.Button(top, text="Save", command=self._save).pack(side="left", padx=4)
         tk.Button(top, text="Save As", command=self._save_as).pack(side="left")
@@ -359,9 +364,138 @@ class LevelEditor(tk.Tk):
         status = tk.Label(self, textvariable=self.status_var, anchor="w")
         status.pack(fill="x", padx=8, pady=(6, 6))
 
+    def _load_defs(self, tiles_path, spawns_path):
+        defs = load_defs(tiles_path, spawns_path)
+        self.tile_defs = defs["tiles"]
+        self.spawn_defs = defs["spawns"]
+        self.tile_names = {k: v.get("name", f"Tile {k}") for k, v in self.tile_defs.items()}
+        self.spawn_names = {k: v.get("name", str(k)) for k, v in self.spawn_defs.items()}
+
     def _resolve_local_path(self, filename):
         local = os.path.join(self.base_dir, filename)
         return local if os.path.exists(local) else filename
+
+    def _icons_dir(self):
+        return os.path.join(self.base_dir, "editor_icons")
+
+    def _icon_pairs(self, data, fallback_stem=None):
+        """Return [(stem, tint_str_or_None), ...] for a def entry."""
+        images = data.get("images", [fallback_stem] if fallback_stem else [])
+        tints = data.get("image_tint", [])
+        return [(stem, tints[i] if i < len(tints) else None) for i, stem in enumerate(images)]
+
+    def _icon_stems_for_tile(self, tile_id):
+        return self._icon_pairs(self.tile_defs.get(tile_id, {}), str(tile_id))
+
+    def _icon_stems_for_entity(self, ent_id):
+        return self._icon_pairs(self.spawn_defs.get(ent_id, {}))
+
+    def _parse_tint_color(self, tint_str):
+        """Convert a tint string to an (r, g, b) tuple 0-255, or None."""
+        import re
+        if not tint_str or tint_str.lower() == "none":
+            return None
+        tint_str = tint_str.strip()
+        if tint_str.startswith("["):
+            nums = re.findall(r"[\d.]+", tint_str)
+            if len(nums) >= 3:
+                return tuple(int(float(n) * 255) for n in nums[:3])
+            return None
+        try:
+            r16, g16, b16 = self.winfo_rgb(tint_str)
+            return (r16 // 256, g16 // 256, b16 // 256)
+        except Exception:
+            return None
+
+    def _tint_image(self, img, tint_rgb):
+        """Return a tinted copy of img using multiplicative blending."""
+        tr, tg, tb = tint_rgb
+        copy = img.copy()
+        w, h = copy.width(), copy.height()
+        for py in range(h):
+            for px in range(w):
+                if copy.transparency_get(px, py):
+                    continue
+                color = copy.get(px, py)
+                if isinstance(color, str):
+                    parts = color.split()
+                    r, g, b = int(parts[0]), int(parts[1]), int(parts[2])
+                else:
+                    r, g, b = color[0], color[1], color[2]
+                copy.put(f"#{r*tr//255:02x}{g*tg//255:02x}{b*tb//255:02x}", (px, py))
+        return copy
+
+    def _apply_color_key(self, img):
+        """Make all pixels matching _COLOR_KEY transparent."""
+        kr, kg, kb = self._COLOR_KEY
+        w, h = img.width(), img.height()
+        pixels = []
+        for py in range(h):
+            for px in range(w):
+                color = img.get(px, py)
+                if isinstance(color, str):
+                    parts = color.split()
+                    r, g, b = int(parts[0]), int(parts[1]), int(parts[2])
+                else:
+                    r, g, b = color[0], color[1], color[2]
+                if r == kr and g == kg and b == kb:
+                    pixels.append((px, py))
+        for px, py in pixels:
+            img.transparency_set(px, py, True)
+
+    def _get_raw_icon(self, stem):
+        """Return the full-size color-keyed PhotoImage for stem, or None."""
+        if stem in self._icon_raw_cache:
+            return self._icon_raw_cache[stem]
+        path = os.path.join(self._icons_dir(), f"{stem}.png")
+        if not os.path.exists(path):
+            self._icon_raw_cache[stem] = None
+            return None
+        try:
+            raw = tk.PhotoImage(file=path)
+            self._apply_color_key(raw)
+        except Exception:
+            self._icon_raw_cache[stem] = None
+            return None
+        self._icon_raw_cache[stem] = raw
+        return raw
+
+    def _get_icon(self, stem, tint_str=None):
+        """Return a subsampled PhotoImage for stem+tint at the current cell_size, or None."""
+        tint_key = tint_str if (tint_str and tint_str.lower() != "none") else None
+        key = (stem, tint_key, self.cell_size)
+        if key in self._icon_cache:
+            return self._icon_cache[key]
+        raw = self._get_raw_icon(stem)
+        if raw is None:
+            self._icon_cache[key] = None
+            return None
+        source = raw
+        if tint_key:
+            tc = (stem, tint_key)
+            if tc not in self._icon_tinted_cache:
+                tint_rgb = self._parse_tint_color(tint_key)
+                self._icon_tinted_cache[tc] = self._tint_image(raw, tint_rgb) if tint_rgb else raw
+            source = self._icon_tinted_cache[tc]
+        try:
+            factor = self._ICON_SIZE // self.cell_size
+            if factor > 1:
+                img = source.subsample(factor)
+            elif factor < 1:
+                img = source.zoom(self.cell_size // self._ICON_SIZE)
+            else:
+                img = source
+        except Exception:
+            self._icon_cache[key] = None
+            return None
+        self._icon_cache[key] = img
+        return img
+
+    def _icon_draw_pos(self, img, x0, y0):
+        """Return (draw_x, draw_y) anchor-nw to center img on the cell."""
+        offset_x = (self.cell_size - img.width()) // 2
+        offset_y = (self.cell_size - img.height()) // 2
+        return x0 + offset_x, y0 + offset_y
 
     def _normalize_input_path(self, raw_path):
         p = (raw_path or "").strip().strip('"').strip("'")
@@ -382,10 +516,10 @@ class LevelEditor(tk.Tk):
         if not os.path.exists(tile_path):
             tile_path = self._resolve_local_path("tiles.gon")
 
-        self.spawn_names = load_spawn_defs(spawn_path)
-        self.tile_defs = load_tile_defs(tile_path)
-        self.tile_names = {k: v.get("name", f"Tile {k}") for k, v in self.tile_defs.items()}
-        self.tile_colors = self._build_tile_colors()
+        self._load_defs(tile_path, spawn_path)
+        self._icon_raw_cache.clear()
+        self._icon_tinted_cache.clear()
+        self._icon_cache.clear()
 
     def _build_default_prefix(self, level):
         spawn_file = (level.spawn_file or "spawns.gon").encode("utf-8", errors="ignore")
@@ -411,77 +545,141 @@ class LevelEditor(tk.Tk):
             + struct.pack("<ii", 0, 0)
         )
 
-    def _new_room(self):
-        if self.preview_active:
-            self._reset_preview(silent=True)
-        self.level = LevelData()
-        self.random_pool = []
-        self._refresh_pool_list()
-        self.path_var.set("")
-        self._populate_sidebar_list()
-        self._draw_grid()
-        self.status_var.set("New blank room.")
+    def _create_room(self):
+        dlg = tk.Toplevel(self)
+        dlg.title("Create New Level")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+
+        spawns_var = tk.StringVar(value=self._resolve_local_path("spawns.gon"))
+        tiles_var = tk.StringVar(value=self._resolve_local_path("tiles.gon"))
+        name_var = tk.StringVar(value="new_level.lvl")
+
+        def browse(var):
+            p = filedialog.askopenfilename(filetypes=[("GON files", "*.gon"), ("All files", "*.*")])
+            if p:
+                var.set(self._normalize_input_path(p))
+
+        for row, (label, var, cmd) in enumerate([
+            ("Spawns:", spawns_var, lambda: browse(spawns_var)),
+            ("Tiles:",  tiles_var,  lambda: browse(tiles_var)),
+        ]):
+            tk.Label(dlg, text=label, anchor="w").grid(row=row, column=0, padx=8, pady=4, sticky="w")
+            tk.Entry(dlg, textvariable=var, width=40).grid(row=row, column=1, padx=4)
+            tk.Button(dlg, text="Browse", command=cmd).grid(row=row, column=2, padx=8)
+
+        tk.Label(dlg, text="Level name:", anchor="w").grid(row=2, column=0, padx=8, pady=4, sticky="w")
+        tk.Entry(dlg, textvariable=name_var, width=40).grid(row=2, column=1, padx=4)
+
+        def confirm():
+            spawns_path = spawns_var.get().strip()
+            tiles_path = tiles_var.get().strip()
+            level_name = name_var.get().strip()
+            if not level_name:
+                messagebox.showerror("Create", "Level name is required.", parent=dlg)
+                return
+            dlg.destroy()
+            if self.preview_active:
+                self._reset_preview(silent=True)
+            self._load_defs(tiles_path, spawns_path)
+            self.level = LevelData()
+            self.level.spawn_file = os.path.basename(spawns_path)
+            self.level.tiles_file = os.path.basename(tiles_path)
+            self.random_pool = []
+            self._refresh_pool_list()
+            self.path_var.set(level_name)
+            self._populate_sidebar_list()
+            self._draw_grid()
+            self.status_var.set(f"Created new level: {level_name}")
+
+        btn_frame = tk.Frame(dlg)
+        btn_frame.grid(row=3, column=0, columnspan=3, pady=8)
+        tk.Button(btn_frame, text="Create", command=confirm).pack(side="left", padx=8)
+        tk.Button(btn_frame, text="Cancel", command=dlg.destroy).pack(side="left")
+
+    _ICON_SIZE = 128
+    _VALID_CELL_SIZES = [16, 32, 64]  # 128 // 8, 128 // 4, 128 // 2
+    _COLOR_KEY = (255, 0, 255)  # magenta background used in all editor icons
+
+    def _snap_cell_size(self, raw):
+        """Snap raw pixel size to the nearest icon-compatible cell size."""
+        return min(self._VALID_CELL_SIZES, key=lambda s: abs(s - raw))
 
     def _on_canvas_resize(self, event):
         size = min(event.width, event.height)
-        cell = max(16, (size - 20) // 10)
+        raw = max(16, (size - 20) // 10)
+        cell = self._snap_cell_size(raw)
         if cell != self.cell_size:
             self.cell_size = cell
+            self._icon_tinted_cache.clear()
+            self._icon_cache.clear()
             self.grid_origin = (10, 10)
             self._draw_grid()
 
     def _draw_grid(self):
         self.canvas.delete("all")
-        ox, oy = self.grid_origin
+        # Pass 1: all backgrounds and tile icons
         for y in range(10):
             for x in range(10):
-                self._draw_cell(x, y)
+                self._draw_cell_bg(x, y)
+        # Pass 2: all entity icons/text on top
+        for y in range(10):
+            for x in range(10):
+                self._draw_cell_fg(x, y)
         self._update_status()
 
-    def _draw_cell(self, x, y):
+    def _cell_coords(self, x, y):
         ox, oy = self.grid_origin
         x0 = ox + x * self.cell_size
         y0 = oy + y * self.cell_size
-        x1 = x0 + self.cell_size
-        y1 = y0 + self.cell_size
-        tile_id = self.level.tiles[y * 10 + x]
-        color = self.tile_colors.get(tile_id, "#9ca3af")
-        self.canvas.create_rectangle(x0, y0, x1, y1, fill=color, outline="#cbd5e1")
+        return x0, y0, x0 + self.cell_size, y0 + self.cell_size
 
-        tile_text = None
+    def _draw_cell_bg(self, x, y):
+        x0, y0, x1, y1 = self._cell_coords(x, y)
         tile_id = self.level.tiles[y * 10 + x]
-        if tile_id in (15, 16, 17, 18):
-            arrows = {15: "↑", 16: "↓", 17: "→", 18: "←"}
-            tile_text = arrows.get(tile_id)
-            if tile_text:
-                self.canvas.create_text(
-                    (x0 + x1) / 2,
-                    (y0 + y1) / 2,
-                    text=tile_text,
-                    fill="#111827",
-                    font=("Arial", max(9, self.cell_size // 3), "bold"),
-                )
+        self.canvas.create_rectangle(x0, y0, x1, y1, fill="#e5e7eb", outline="#cbd5e1")
 
+        for stem, tint in self._icon_stems_for_tile(tile_id):
+            tile_icon = self._get_icon(stem, tint)
+            if tile_icon:
+                ix, iy = self._icon_draw_pos(tile_icon, x0, y0)
+                self.canvas.create_image(ix, iy, image=tile_icon, anchor="nw")
+
+
+    def _draw_cell_fg(self, x, y):
+        x0, y0, x1, y1 = self._cell_coords(x, y)
         ent_list = self.level.entities.get((x, y), [])
-        if ent_list:
-            ent = ent_list[0]
-            ent_id = ent.id
-            if ent.is_random:
-                if self.preview_active:
-                    resolved_id = self.preview_map.get((x, y, 0), 0)
-                    label = self.spawn_names.get(resolved_id, str(resolved_id))
-                else:
-                    first_id = ent.options[0][0] if ent.options else 0
-                    label = f"RND:{self.spawn_names.get(first_id, str(first_id))}"
+        if not ent_list:
+            return
+        ent = ent_list[0]
+        ent_id = ent.id
+        if ent.is_random:
+            if self.preview_active:
+                resolved_id = self.preview_map.get((x, y, 0), 0)
+                label = self.spawn_names.get(resolved_id, str(resolved_id))
+                display_id = resolved_id
             else:
-                label = self.spawn_names.get(ent_id, str(ent_id))
-            text = label
-            if len(ent_list) > 1:
-                text = f"{text}*"
+                first_id = ent.options[0][0] if ent.options else 0
+                label = f"RND:{self.spawn_names.get(first_id, str(first_id))}"
+                display_id = first_id
+        else:
+            label = self.spawn_names.get(ent_id, str(ent_id))
+            display_id = ent_id
+        if len(ent_list) > 1:
+            label = f"{label}*"
+
+        drew_icon = False
+        for stem, tint in self._icon_stems_for_entity(display_id):
+            ent_icon = self._get_icon(stem, tint)
+            if ent_icon:
+                ix, iy = self._icon_draw_pos(ent_icon, x0, y0)
+                self.canvas.create_image(ix, iy, image=ent_icon, anchor="nw")
+                drew_icon = True
+        if not drew_icon:
             self.canvas.create_text(
                 (x0 + x1) / 2,
                 (y0 + y1) / 2,
-                text=text,
+                text=label,
                 fill="#111827",
                 font=("Arial", max(6, self.cell_size // 7), "bold"),
                 width=max(8, self.cell_size - 10),
@@ -490,81 +688,7 @@ class LevelEditor(tk.Tk):
 
     def _tile_label(self, tile_id):
         name = self.tile_names.get(tile_id, "Unknown")
-        if tile_id in (15, 16, 17, 18):
-            arrow = {15: "↑", 16: "↓", 17: "→", 18: "←"}.get(tile_id, "")
-            if arrow:
-                name = f"{name} {arrow}"
         return f"{name} ({tile_id})"
-
-    def _color_from_name(self, name):
-        n = name.lower()
-        if "water" in n:
-            return "#3b82f6"
-        if "ice" in n or "snow" in n or "supercooled" in n:
-            return "#38bdf8"
-        if "grass" in n or "flower" in n or "bramble" in n:
-            return "#22c55e"
-        if "lava" in n or "fire" in n:
-            return "#f97316"
-        if "toxic" in n or "sludge" in n:
-            return "#84cc16"
-        if "rock" in n or "stalagmite" in n:
-            return "#9ca3af"
-        if "metal" in n or "road" in n:
-            return "#64748b"
-        if "dirt" in n:
-            return "#a16207"
-        if "shadow" in n:
-            return "#111827"
-        if "glass" in n or "glitch" in n:
-            return "#d1d5db"
-        if "creep" in n:
-            return "#a855f7"
-        if "oil" in n:
-            return "#1f2937"
-        return "#e5e7eb"
-
-    def _build_tile_colors(self):
-        overrides = {
-            0: "#e5e7eb",  # Empty
-            1: "#2563eb",  # Water
-            2: "#22c55e",  # Grass
-            3: "#15803d",  # Tall Grass
-            4: "#f97316",  # Fire
-            5: "#7dd3fc",  # Ice
-            6: "#dc2626",  # Lava
-            7: "#94a3b8",  # Metal
-            8: "#6b7280",  # Rock
-            9: "#a855f7",  # Creep
-            10: "#0f172a",  # Oil
-            11: "#84cc16",  # Toxic Sludge
-            12: "#111827",  # Shadow
-            13: "#e5e7eb",  # Glass Shards
-            14: "#f8fafc",  # Snow
-            15: "#1d4ed8",  # Water current N
-            16: "#2563eb",  # Water current S
-            17: "#3b82f6",  # Water current E
-            18: "#60a5fa",  # Water current W
-            19: "#a16207",  # Dirt
-            20: "#64748b",  # Stalagmites
-            21: "#475569",  # Road Tile
-            22: "#166534",  # Brambles
-            23: "#ec4899",  # Flowers
-            24: "#f472b6",  # Tall Flower Tile
-            25: "#06b6d4",  # Supercooled Water
-            26: "#9ca3af",  # Glitch Tile
-        }
-        colors = {}
-        for tile_id, data in self.tile_defs.items():
-            name = data.get("name", f"Tile {tile_id}")
-            if tile_id in overrides:
-                colors[tile_id] = overrides[tile_id]
-            else:
-                base = self._color_from_name(name)
-                colors[tile_id] = base
-        if DEFAULT_TILE not in colors:
-            colors[DEFAULT_TILE] = "#e5e7eb"
-        return colors
 
     def _populate_tile_list(self, filter_text=""):
         self.sidebar_listbox.delete(0, tk.END)
