@@ -5,7 +5,6 @@ import tkinter as tk
 from dataclasses import dataclass, field
 from tkinter import filedialog, messagebox
 
-DEFAULT_TILE = 0
 
 @dataclass
 class SpawnObject:
@@ -37,7 +36,7 @@ class LevelData:
         self.mode = 1
         self.spawn_file = "spawns.gon"
         self.tiles_file = "tiles.gon"
-        self.tiles = [DEFAULT_TILE] * (self.width * self.height)
+        self.tiles = [0] * (self.width * self.height)
         self.entities = {}  # (x,y) -> [SpawnObject, ...]
         self.raw_prefix = b""
         self.raw_tiles = b""
@@ -281,8 +280,8 @@ class LevelEditor(tk.Tk):
         tk.Radiobutton(controls, text="Tile", variable=self.mode_var, value="tile", command=self._on_mode_change).pack(side="left")
         tk.Radiobutton(controls, text="Entity", variable=self.mode_var, value="entity", command=self._on_mode_change).pack(side="left")
 
-        self.tile_var = tk.IntVar(value=DEFAULT_TILE)
-        self.entity_id_var = tk.StringVar(value="2050")
+        self.tile_var = tk.IntVar(value=0)
+        self.entity_id_var = tk.StringVar(value="")
         self.entity_extra_var = tk.StringVar(value="0")
         self.entity_spawn_type_var = tk.StringVar(value="fixed")
         self.entity_roll_index_var = tk.StringVar(value="0")
@@ -506,17 +505,16 @@ class LevelEditor(tk.Tk):
             p = p.replace("\\", os.sep)
         return os.path.normpath(p)
 
-    def _reload_defs_for_level(self, level_path):
+    def _reload_defs_for_level(self, level_path, spawn_file, tiles_file):
         level_dir = os.path.dirname(level_path)
-        spawn_path = os.path.join(level_dir, "spawns.gon")
-        tile_path = os.path.join(level_dir, "tiles.gon")
 
-        if not os.path.exists(spawn_path):
-            spawn_path = self._resolve_local_path("spawns.gon")
-        if not os.path.exists(tile_path):
-            tile_path = self._resolve_local_path("tiles.gon")
+        def resolve(filename):
+            p = os.path.join(level_dir, filename)
+            if os.path.exists(p):
+                return p
+            return self._resolve_local_path(filename)
 
-        self._load_defs(tile_path, spawn_path)
+        self._load_defs(resolve(tiles_file), resolve(spawn_file))
         self._icon_raw_cache.clear()
         self._icon_tinted_cache.clear()
         self._icon_cache.clear()
@@ -638,6 +636,9 @@ class LevelEditor(tk.Tk):
         x0, y0, x1, y1 = self._cell_coords(x, y)
         tile_id = self.level.tiles[y * 10 + x]
         self.canvas.create_rectangle(x0, y0, x1, y1, fill="#e5e7eb", outline="#cbd5e1")
+
+        if tile_id == 0:
+            return
 
         for stem, tint in self._icon_stems_for_tile(tile_id):
             tile_icon = self._get_icon(stem, tint)
@@ -773,7 +774,7 @@ class LevelEditor(tk.Tk):
         except Exception as exc:
             messagebox.showerror("Load failed", str(exc))
             return
-        self._reload_defs_for_level(path)
+        self._reload_defs_for_level(path, loaded.spawn_file, loaded.tiles_file)
         self.preview_active = False
         self.preview_map = {}
         self.level = loaded
@@ -858,7 +859,7 @@ class LevelEditor(tk.Tk):
             self._reset_preview(silent=True)
         x, y = cell
         if self.mode_var.get() == "tile":
-            self.level.tiles[y * 10 + x] = DEFAULT_TILE
+            self.level.tiles[y * 10 + x] = 0
         else:
             if (x, y) in self.level.entities:
                 del self.level.entities[(x, y)]
@@ -1093,7 +1094,7 @@ class LevelEditor(tk.Tk):
                     chunks.append(struct.pack("<HH", pid & 0xFFFF, weight & 0xFFFF))
         entity_bytes = b"".join(chunks)
 
-        raw_prefix = self.level.raw_prefix if self.level.raw_prefix else self._build_default_prefix(self.level)
+        raw_prefix = self._build_default_prefix(self.level)
         new_data = bytearray(raw_prefix + tile_bytes + entity_bytes + self.level.tail)
         struct.pack_into("<I", new_data, 16, entity_count)
 
